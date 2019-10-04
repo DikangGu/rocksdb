@@ -9,12 +9,12 @@
 #include <string>
 #include <vector>
 
-#include "db/db_impl.h"
+#include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
+#include "file/file_util.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/transaction_log.h"
-#include "util/file_util.h"
 #include "util/string_util.h"
 
 namespace rocksdb {
@@ -313,6 +313,7 @@ TEST_F(RepairTest, RepairColumnFamilyOptions) {
     ASSERT_EQ(comparator_name,
               fname_and_props.second->comparator_name);
   }
+  Close();
 
   // Also check comparator when it's provided via "unknown" CF options
   ASSERT_OK(RepairDB(dbname_, opts, {{"default", opts}},

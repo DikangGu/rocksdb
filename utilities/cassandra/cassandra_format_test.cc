@@ -5,7 +5,7 @@
 
 #include <cstring>
 #include <memory>
-#include "util/testharness.h"
+#include "test_util/testharness.h"
 #include "utilities/cassandra/format.h"
 #include "utilities/cassandra/serialize.h"
 #include "utilities/cassandra/test_utils.h"
@@ -125,13 +125,14 @@ TEST(ExpiringColumnTest, ExpiringColumn) {
 TEST(TombstoneTest, TombstoneCollectable) {
   int32_t now = (int32_t)time(nullptr);
   int32_t gc_grace_seconds = 16440;
+  int32_t time_delta_seconds = 10;
   EXPECT_TRUE(Tombstone(ColumnTypeMask::DELETION_MASK, 0,
-                        now - gc_grace_seconds,
-                        ToMicroSeconds(now - gc_grace_seconds))
+                        now - gc_grace_seconds - time_delta_seconds,
+                        ToMicroSeconds(now - gc_grace_seconds - time_delta_seconds))
                   .Collectable(gc_grace_seconds));
   EXPECT_FALSE(Tombstone(ColumnTypeMask::DELETION_MASK, 0,
-                         now - gc_grace_seconds + 1,
-                         ToMicroSeconds(now - gc_grace_seconds + 1))
+                         now - gc_grace_seconds + time_delta_seconds,
+                         ToMicroSeconds(now - gc_grace_seconds + time_delta_seconds))
                    .Collectable(gc_grace_seconds));
 }
 
@@ -316,12 +317,13 @@ TEST(RowValueTest, RowWithColumns) {
 TEST(RowValueTest, PurgeTtlShouldRemvoeAllColumnsExpired) {
   int64_t now = time(nullptr);
 
-  auto row_value = CreateTestRowValue({
-    CreateTestColumnSpec(kColumn, 0, ToMicroSeconds(now)),
-    CreateTestColumnSpec(kExpiringColumn, 1, ToMicroSeconds(now - kTtl - 10)), //expired
-    CreateTestColumnSpec(kExpiringColumn, 2, ToMicroSeconds(now)), // not expired
-    CreateTestColumnSpec(kTombstone, 3, ToMicroSeconds(now))
-  });
+  auto row_value = CreateTestRowValue(
+      {CreateTestColumnSpec(kColumn, 0, ToMicroSeconds(now)),
+       CreateTestColumnSpec(kExpiringColumn, 1,
+                            ToMicroSeconds(now - kTtl - 10)),  // expired
+       CreateTestColumnSpec(kExpiringColumn, 2,
+                            ToMicroSeconds(now)),  // not expired
+       CreateTestColumnSpec(kTombstone, 3, ToMicroSeconds(now))});
 
   bool changed = false;
   auto purged = row_value.RemoveExpiredColumns(&changed);
@@ -338,12 +340,13 @@ TEST(RowValueTest, PurgeTtlShouldRemvoeAllColumnsExpired) {
 TEST(RowValueTest, ExpireTtlShouldConvertExpiredColumnsToTombstones) {
   int64_t now = time(nullptr);
 
-  auto row_value = CreateTestRowValue({
-    CreateTestColumnSpec(kColumn, 0, ToMicroSeconds(now)),
-    CreateTestColumnSpec(kExpiringColumn, 1, ToMicroSeconds(now - kTtl - 10)), //expired
-    CreateTestColumnSpec(kExpiringColumn, 2, ToMicroSeconds(now)), // not expired
-    CreateTestColumnSpec(kTombstone, 3, ToMicroSeconds(now))
-  });
+  auto row_value = CreateTestRowValue(
+      {CreateTestColumnSpec(kColumn, 0, ToMicroSeconds(now)),
+       CreateTestColumnSpec(kExpiringColumn, 1,
+                            ToMicroSeconds(now - kTtl - 10)),  // expired
+       CreateTestColumnSpec(kExpiringColumn, 2,
+                            ToMicroSeconds(now)),  // not expired
+       CreateTestColumnSpec(kTombstone, 3, ToMicroSeconds(now))});
 
   bool changed = false;
   auto compacted = row_value.ConvertExpiredColumnsToTombstones(&changed);
@@ -356,6 +359,109 @@ TEST(RowValueTest, ExpireTtlShouldConvertExpiredColumnsToTombstones) {
 
   compacted.ConvertExpiredColumnsToTombstones(&changed);
   EXPECT_FALSE(changed);
+}
+
+TEST(DeletionTimeTest, Supersedes) {
+  DeletionTime t1(100, 100);
+  DeletionTime t2(100, 101);
+  DeletionTime t3(101, 101);
+  EXPECT_TRUE(t2.Supersedes(t1));
+  EXPECT_TRUE(t3.Supersedes(t2));
+  EXPECT_TRUE(t3.Supersedes(t1));
+  EXPECT_TRUE(t1.Supersedes(DeletionTime::kLive));
+}
+
+TEST(DeletionTimeTest, Equality) {
+  EXPECT_EQ(DeletionTime(100, 101), DeletionTime(100, 101));
+  EXPECT_NE(DeletionTime(100, 101), DeletionTime(100, 102));
+  EXPECT_NE(DeletionTime(100, 101), DeletionTime(99, 101));
+}
+
+TEST(DeletionTimeTest, Serialization) {
+  DeletionTime t(100, 101);
+  std::string val;
+  t.Serialize(&val);
+  EXPECT_EQ(DeletionTime::Deserialize(val.data()), t);
+}
+
+std::unique_ptr<PartitionDeletion> pd_make_unique(
+    const Slice& slice, int32_t local_deletion_time,
+    int64_t marked_for_delete_at) {
+  return std::unique_ptr<PartitionDeletion>(new PartitionDeletion(
+      slice, DeletionTime(local_deletion_time, marked_for_delete_at)));
+}
+
+std::unique_ptr<PartitionDeletion> pd_make_unique(const PartitionDeletion& pd) {
+  return std::unique_ptr<PartitionDeletion>(new PartitionDeletion(pd));
+}
+
+void AssertRoundTrip(PartitionDeletions& pds) {
+  std::string value;
+  PartitionDeletion::Serialize(std::move(pds), &value);
+  PartitionDeletions deserialized =
+      PartitionDeletion::Deserialize(value.data(), value.size());
+  EXPECT_EQ(pds.size(), deserialized.size());
+  for (std::size_t i = 0; i < pds.size(); i++) {
+    EXPECT_EQ(*pds[i], *deserialized[i]);
+  }
+}
+
+TEST(ParitionDeletionTest, Serialization) {
+  PartitionDeletions pds;
+  AssertRoundTrip(pds);
+  pds.push_back(pd_make_unique(Slice("a"), 100, 200));
+  AssertRoundTrip(pds);
+  pds.push_back(pd_make_unique(Slice("b"), 0, 0));
+  AssertRoundTrip(pds);
+  pds.push_back(pd_make_unique(Slice("abc"),
+                               std::numeric_limits<int32_t>::max(),
+                               std::numeric_limits<int64_t>::min()));
+  AssertRoundTrip(pds);
+}
+
+TEST(ParitionDeletionTest, MergeEmpty) {
+  EXPECT_EQ(PartitionDeletions(),
+            PartitionDeletion::Merge(PartitionDeletions()));
+}
+
+TEST(ParitionDeletionTest, MergeSingle) {
+  PartitionDeletion pd0(Slice("a"), DeletionTime(100, 200));
+  PartitionDeletions pds;
+  pds.push_back(pd_make_unique(pd0));
+  PartitionDeletions merged = PartitionDeletion::Merge(std::move(pds));
+  EXPECT_EQ(1, merged.size());
+  EXPECT_EQ(pd0, *merged[0]);
+}
+
+TEST(ParitionDeletionTest, MergeSinglePKKeepLast) {
+  PartitionDeletion pd0(Slice("a"), DeletionTime(100, 200));
+  PartitionDeletion pd1(Slice("a"), DeletionTime(101, 300));
+  PartitionDeletion pd2(Slice("a"), DeletionTime(100, 300));
+
+  PartitionDeletions pds;
+  pds.push_back(pd_make_unique(pd0));
+  pds.push_back(pd_make_unique(pd1));
+  pds.push_back(pd_make_unique(pd2));
+
+  PartitionDeletions merged = PartitionDeletion::Merge(std::move(pds));
+  EXPECT_EQ(1, merged.size());
+  EXPECT_EQ(pd1, *merged[0]);
+}
+
+TEST(ParitionDeletionTest, MergeKeepLastestDeletionPerPK) {
+  PartitionDeletion pd0(Slice("a"), DeletionTime(100, 200));
+  PartitionDeletion pd1(Slice("b"), DeletionTime(100, 200));
+  PartitionDeletion pd2(Slice("a"), DeletionTime(101, 300));
+  PartitionDeletion pd3(Slice("a"), DeletionTime(100, 300));
+  PartitionDeletions pds;
+  pds.push_back(pd_make_unique(pd0));
+  pds.push_back(pd_make_unique(pd1));
+  pds.push_back(pd_make_unique(pd2));
+  pds.push_back(pd_make_unique(pd3));
+  PartitionDeletions merged = PartitionDeletion::Merge(std::move(pds));
+  EXPECT_EQ(2, merged.size());
+  EXPECT_EQ(pd2, *merged[0]);
+  EXPECT_EQ(pd1, *merged[1]);
 }
 } // namespace cassandra
 } // namespace rocksdb
